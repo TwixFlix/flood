@@ -1,0 +1,8 @@
+numpy
+matplotlib
+pillow
+requests
+pandas
+# optional
+# global-land-mask
+# rasterio
