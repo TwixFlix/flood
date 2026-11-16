@@ -33,6 +33,37 @@ python flood_sim.py --dem examples/dem.asc --rain examples/rain.csv --towns exam
   --river-mask examples/river_mask.asc --source 0,53 --source 0,54 --catchment-area 150 --edges S --out results
 ```
 
+## Choosing where the data comes from
+
+`flood_sim.py` can take each input from **your own file** or **download it from Open-Meteo** (https://open-meteo.com/en/docs). You can mix them.
+
+**Easiest: press Run with no options** (e.g. in PyCharm). It asks you step by step:
+elevation from a file / Open-Meteo / demo, rain from a file / Open-Meteo / typed in by hand / a made-up storm, then communities and output folder. At the end it prints the matching command so you can re-run without the questions.
+
+**Or on the command line:**
+```bash
+# both online: forecast for the next 3 days
+python flood_sim.py --dem online --rain online --area 25.04,121.55,25.10,121.65 --forecast 3 --towns towns.csv
+# both online: a past typhoon
+python flood_sim.py --dem online --rain online --area 25.00,121.45,25.10,121.58 --start 2024-10-02 --end 2024-10-04
+# your own elevation, rain from Open-Meteo (a lat/lon CSV gives the area automatically)
+python flood_sim.py --dem elevation_grid.csv --rain online --start 2024-10-02 --end 2024-10-04
+python flood_sim.py --dem dem.asc --rain online --area 25.04,121.55,25.10,121.65 --forecast 2
+# your own rain typed in: mm in each hour
+python flood_sim.py --dem dem.asc --rain-values 5,20,60,80,40,10
+```
+
+| Option | Meaning |
+|---|---|
+| `--dem online` | download elevation (Copernicus ~90 m) for `--area` at `--cell` metres (default 100) |
+| `--rain online` | download hourly rain; dates from `--start/--end` (back to 1940) or `--forecast N` (1–16 days, default 3) |
+| `--area S,W,N,E` | box in degrees. With a lat/lon elevation CSV, `--rain online` uses its area if you leave this out |
+| `--rain-model` | forecast model, e.g. `best_match` (default), `jma_seamless`, `ecmwf_ifs025`, `gfs_seamless` |
+| `--rain-values` | rain typed in by hand, mm per hour, comma-separated |
+| `--cache`, `--refresh` | downloads are kept in `openmeteo_cache/` and re-used; `--refresh` downloads again |
+
+If your elevation file has no coordinates (`.asc`, matrix `.csv`, `.png`), online rain is averaged over `--area` and applied everywhere.
+
 ## Real places: Open-Meteo workflow
 
 The included `elevation_box.py` (elevation, ~90 m Copernicus DEM) and `rainfall.py` (past or forecast rain) fetch data for any lat/lon box. The simulator reads their CSVs directly.

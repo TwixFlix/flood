@@ -16,6 +16,18 @@ Quick start
     python flood_sim.py --demo valley --out demo_valley
     python flood_sim.py --dem dem.asc --rain rain.csv --towns towns.csv --out results
 
+    # download elevation + rain from Open-Meteo instead of using files
+    python flood_sim.py --dem online --rain online --area 25.04,121.55,25.10,121.65 --forecast 3
+    python flood_sim.py --dem online --rain online --area 25.00,121.45,25.10,121.58 \
+        --start 2024-10-02 --end 2024-10-04 --towns my_towns.csv
+
+    # mix: your own elevation file, rain from Open-Meteo (or typed in by hand)
+    python flood_sim.py --dem elevation_grid.csv --rain online --start 2024-10-02 --end 2024-10-04
+    python flood_sim.py --dem dem.asc --rain-values 5,20,60,80,40,10
+
+Press Run with no options (e.g. in PyCharm) and it asks you step by step
+where each input should come from.
+
 Run `python flood_sim.py -h` for every option, and see README.md for the
 input file formats.
 
@@ -121,7 +133,8 @@ def read_latlon_dem(path: str, dx: float | None) -> tuple[np.ndarray, GridMeta]:
     width, height = (lons[-1] - lons[0]) * kx, (lats[-1] - lats[0]) * ky
     nx, ny = max(int(width // dx) + 1, 2), max(int(height // dx) + 1, 2)
     x_left, y_top = (lons[0] - lonc) * kx, (lats[-1] - latc) * ky
-    meta = GridMeta(cellsize=dx, geo=dict(latc=latc, lonc=lonc, x_left=x_left, y_top=y_top, dx=dx))
+    meta = GridMeta(cellsize=dx, geo=dict(latc=latc, lonc=lonc, x_left=x_left, y_top=y_top, dx=dx,
+                                          bounds=(float(lats[0]), float(lons[0]), float(lats[-1]), float(lons[-1]))))
     rr, cc = np.mgrid[0:ny, 0:nx]
     glat, glon = meta.rc_to_latlon(rr, cc)
     fi = np.clip((glat - lats[0]) / dlat, 0, len(lats) - 1); fj = np.clip((glon - lons[0]) / dlon, 0, len(lons) - 1)
@@ -1033,7 +1046,8 @@ def build_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = p.add_argument_group("terrain 地形")
     g.add_argument("--demo", choices=["valley", "basin", "coast"], help="use a built-in demo terrain (also writes sample input files)")
-    g.add_argument("--dem", help="elevation grid: .asc (ESRI ASCII), .csv/.txt matrix, .tif (GeoTIFF), or grayscale .png")
+    g.add_argument("--dem", help="elevation grid: .asc (ESRI ASCII), .csv/.txt matrix, lat/lon .csv, .tif (GeoTIFF), "
+                                 "grayscale .png, or 'online' to download it from Open-Meteo for --area")
     g.add_argument("--dx", type=float, help="cell size in metres (read from .asc/.tif if omitted)")
     g.add_argument("--png-min", type=float, default=0.0, help="elevation of black pixels (image DEM)")
     g.add_argument("--png-max", type=float, default=500.0, help="elevation of white pixels (image DEM)")
@@ -1045,7 +1059,9 @@ def build_parser():
     g.add_argument("--sea-below", type=float, default=0.0, help="cells with elevation below this are sea")
 
     g = p.add_argument_group("rainfall 降雨")
-    g.add_argument("--rain", help="CSV: time_h,rain_mm (one series) or time_h,<station...> (with --stations)")
+    g.add_argument("--rain", help="CSV: time_h,rain_mm (one series), time_h,<station...> (with --stations), "
+                                  "Open-Meteo lat,lon,time,rain_mm, or 'online' to download it")
+    g.add_argument("--rain-values", help="type the rain in by hand: mm in each hour, e.g. '5,20,60,80,40,10'")
     g.add_argument("--stations", help="CSV of rain-station locations: name,row,col or name,x,y (IDW interpolation)")
     g.add_argument("--rain-grid", help="grid multiplier on rainfall (same size as DEM), e.g. a radar-based ratio map")
     g.add_argument("--rain-total", type=float, default=350.0, help="synthetic storm: total rainfall (mm)")
@@ -1054,6 +1070,19 @@ def build_parser():
     g.add_argument("--daily-pattern", choices=["uniform", "center", "front", "back"], default="center",
                    help="how to spread DAILY rain totals over 24 h (hourly data is better)")
     g.add_argument("--oro", type=float, default=None, help="%% extra rain per 1000 m elevation (default 40 synthetic, 0 for files)")
+
+    g = p.add_argument_group("online data 線上資料 (Open-Meteo, used with --dem online / --rain online)")
+    g.add_argument("--area", help="box 'south,west,north,east' in degrees (for --rain online it defaults to the lat/lon DEM's area)")
+    g.add_argument("--cell", type=float, default=100.0, help="cell size (m) for --dem online; Open-Meteo's DEM is ~90 m")
+    g.add_argument("--start", help="first day of rain YYYY-MM-DD (past back to 1940, or up to 16 days ahead)")
+    g.add_argument("--end", help="last day of rain YYYY-MM-DD (default = --start)")
+    g.add_argument("--forecast", type=int, help="rain for the next N days (1–16) instead of --start/--end; default 3")
+    g.add_argument("--rain-model", default="best_match",
+                   help="Open-Meteo weather model for forecasts, e.g. best_match, jma_seamless, ecmwf_ifs025, gfs_seamless")
+    g.add_argument("--rain-step", type=float, default=0.05, help="spacing of rain sample points (degrees)")
+    g.add_argument("--cache", default="openmeteo_cache", help="folder for downloads (re-used on the next run)")
+    g.add_argument("--refresh", action="store_true", help="download again even if a cached copy exists")
+    g.add_argument("--max-calls", type=int, default=3000, help="refuse elevation downloads needing more API calls")
 
     g = p.add_argument_group("river inflow 上游河川")
     g.add_argument("--source", action="append", default=[], help="inflow cell 'row,col' (repeatable)")
@@ -1101,8 +1130,153 @@ def _find(names):
     return None
 
 
+DEFAULT_AREA = "25.04,121.55,25.10,121.65"   # lower Keelung River, Taipei
+
+
+def _ask(prompt, default=None, choices=None):
+    sfx = f" [{default}]" if default not in (None, "") else ""
+    while True:
+        v = input(f"{prompt}{sfx}: ").strip().strip('"').strip("'")
+        if not v and default is not None:
+            v = str(default)
+        if choices and v not in choices:
+            print(f"  please type one of: {', '.join(choices)}")
+            continue
+        if v or default is not None:
+            return v
+
+
+def _ask_file(prompt, default=None):
+    while True:
+        v = _ask(prompt, default)
+        if v and os.path.exists(os.path.expanduser(v)):
+            return os.path.expanduser(v)
+        print(f"  file not found: {v!r} (drag the file into this window, or type its full path)")
+
+
+def setup_questions():
+    """Ask where each input comes from; returns an argv list for main()."""
+    print("=" * 64)
+    print(" 淹水模擬 Flood simulator — setup (press Enter to accept [defaults])")
+    print("=" * 64)
+    args = []
+    found_dem, found_rain, found_towns = _find(DEM_NAMES), _find(RAIN_NAMES), _find(TOWN_NAMES)
+
+    print("\nElevation 地形:\n  1) my own file\n  2) download from Open-Meteo (pick an area)\n  3) built-in demo")
+    src = _ask("choose", "1" if found_dem else "2", ["1", "2", "3"])
+    area = None
+    if src == "1":
+        args += ["--dem", _ask_file("elevation file (.asc .tif .csv .png)", found_dem)]
+        if os.path.splitext(args[-1])[1].lower() in (".csv", ".txt", ".png") and not is_latlon_csv(args[-1]):
+            dx = _ask("cell size in metres", "40")
+            args += ["--dx", dx]
+    elif src == "2":
+        area = _ask("area as south,west,north,east (degrees)", DEFAULT_AREA)
+        args += ["--dem", "online", "--area", area, "--cell", _ask("cell size in metres (100 or less is best)", "100")]
+    else:
+        args += ["--demo", _ask("demo terrain: valley / basin / coast", "valley", ["valley", "basin", "coast"])]
+
+    if src != "3":
+        print("\nRain 降雨:\n  1) my own file\n  2) download from Open-Meteo (past or forecast)"
+              "\n  3) type it in (mm in each hour)\n  4) made-up design storm")
+        r = _ask("choose", "1" if found_rain else "2", ["1", "2", "3", "4"])
+        if r == "1":
+            args += ["--rain", _ask_file("rain file (.csv)", found_rain)]
+            if found_rain is None or args[-1] != found_rain:
+                st = _ask("rain-station locations file (Enter if the file has one series)", "")
+                if st:
+                    args += ["--stations", st]
+        elif r == "2":
+            args += ["--rain", "online"]
+            dem_is_geo = src == "2" or (src == "1" and is_latlon_csv(args[1]))
+            if not dem_is_geo:
+                area = _ask("area for the rain, south,west,north,east (degrees)", DEFAULT_AREA)
+            if area and "--area" not in args:
+                args += ["--area", area]
+            when = _ask("dates: 'f N' = forecast next N days, or 'YYYY-MM-DD YYYY-MM-DD' for a past event", "f 3")
+            parts = when.replace(",", " ").split()
+            if parts[0].lower() in ("f", "forecast"):
+                args += ["--forecast", parts[1] if len(parts) > 1 else "3"]
+            else:
+                args += ["--start", parts[0]] + (["--end", parts[1]] if len(parts) > 1 else [])
+        elif r == "3":
+            args += ["--rain-values", _ask("mm of rain in each hour, comma-separated", "10,30,60,80,50,20,10")]
+        else:
+            args += ["--rain-total", _ask("total rain (mm)", "350"), "--rain-hours", _ask("over how many hours", "24")]
+
+        t = _ask("\ncommunities file (name,population,lat,lon,radius_m) — Enter for none", found_towns or "")
+        if t:
+            args += ["--towns", t]
+        if src in ("1", "2"):
+            geo = src == "2" or is_latlon_csv(args[1])
+            sl = _ask(f"river entering the area from upstream? give {'lat,lon' if geo else 'row,col'} "
+                      f"where it enters (Enter = none)", "")
+            if sl:
+                args += ["--source-latlon" if geo else "--source", sl,
+                         "--catchment-area", _ask("  upstream catchment area (km²)", "100")]
+    args += ["--out", _ask("\noutput folder", "flood_results")]
+    print("\nSame run next time without questions:\n  python flood_sim.py " +
+          " ".join(f'"{x}"' if " " in x else x for x in args) + "\n")
+    return args
+
+
+def resolve_online_dem(a):
+    """--dem online -> download and point a.dem at the CSV."""
+    if a.dem and a.dem.lower() == "online":
+        import online
+        if not a.area:
+            raise SystemExit("--dem online needs --area south,west,north,east")
+        a.dem = online.fetch_elevation(online.parse_box(a.area), a.cell, a.cache, a.max_calls, a.refresh)
+
+
+def resolve_online_rain(a, meta):
+    """--rain online / --rain-values -> a rain CSV path; returns the datetime of t=0 if known."""
+    if a.rain_values:
+        import online
+        os.makedirs(os.path.join(a.out, "inputs"), exist_ok=True)
+        path = os.path.join(a.out, "inputs", "rain_typed.csv")
+        v = online.write_typed_rain(a.rain_values, path)
+        print(f"Rain typed in: {len(v)} h, total {sum(v):g} mm, peak {max(v):g} mm/h -> {path}")
+        a.rain = path
+        return None
+    if not (a.rain and a.rain.lower() == "online"):
+        return None
+    import online
+    if a.area:
+        box = online.parse_box(a.area)
+    elif meta is not None and meta.geo and meta.geo.get("bounds"):
+        box = meta.geo["bounds"]
+        print(f"Rain area taken from the elevation file: {', '.join(f'{v:.4f}' for v in box)}")
+    else:
+        raise SystemExit("--rain online needs --area south,west,north,east "
+                         "(your elevation file has no coordinates)")
+    start, end = online.parse_dates(a.start, a.end, a.forecast)
+    if not (a.start or a.forecast):
+        print("No --start/--forecast given: using the forecast for the next 3 days")
+    path = online.fetch_rain(box, start, end, a.rain_step, a.rain_model, a.cache, a.refresh)
+    if meta is not None and meta.geo:
+        a.rain = path
+        return None
+    # DEM without coordinates: use the area-average rain as one series
+    os.makedirs(os.path.join(a.out, "inputs"), exist_ok=True)
+    series = os.path.join(a.out, "inputs", "rain_online_series.csv")
+    t0 = online.rain_to_series(path, series)
+    print(f"  elevation file has no coordinates, so the area-average rain is used everywhere ({series})")
+    a.rain = series
+    return t0
+
+
 def main(argv=None):
+    if argv is None and len(sys.argv) == 1:
+        try:
+            argv = setup_questions()
+        except (EOFError, KeyboardInterrupt):
+            print("\n(no answers; looking for files next to the script instead)")
+            argv = []
     a = build_parser().parse_args(argv)
+    if a.rain_values and a.rain:
+        raise SystemExit("give either --rain or --rain-values, not both")
+    resolve_online_dem(a)
     if not a.dem and not a.demo:
         # No terrain given (e.g. pressed Run in an IDE): use files found next to the script, else a demo.
         a.dem = _find(DEM_NAMES)
@@ -1183,13 +1357,14 @@ def main(argv=None):
     assign_town_cells(towns, T, river)
 
     # ---------------- rainfall ----------------
+    rain_t0 = resolve_online_rain(a, None if a.demo else meta)
     if a.rain:
         geo_meta = meta
         if a.coarsen > 1 and meta.geo:
             geo_meta = GridMeta(cellsize=dx, geo={**meta.geo, "dx": dx})
         rain = Rainfall.from_csv(T.shape, a.rain, a.stations, grid_rc, geo_meta, a.daily_pattern)
         global T0
-        T0 = rain.t0
+        T0 = rain.t0 = rain.t0 or rain_t0
         oro = 0.0 if a.oro is None else a.oro
     else:
         rain = Rainfall.synthetic(T.shape, a.rain_total, a.rain_hours, a.pattern)

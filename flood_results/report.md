@@ -2,7 +2,7 @@
 
 - 範圍 Area: 4.0 × 4.0 km, cell 40 m (100×100)
 - 降雨 Rain: synthetic, 350 mm over 24 h; soil loam; drainage 78.8 mm/h
-- 模擬時間 Simulated: 34.0 h · 運算 run time 25 s
+- 模擬時間 Simulated: 34.0 h · 運算 run time 20 s
 - 淹水 ≥ 0.3 m 面積 Area flooded ≥ 0.3 m: 2.08 km²
 - 撤離標準 Criteria: ≥ 20% of area at ≥ 0.5 m, or hazard ≥ 1.25
 
