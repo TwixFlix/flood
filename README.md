@@ -33,6 +33,27 @@ python flood_sim.py --dem examples/dem.asc --rain examples/rain.csv --towns exam
   --river-mask examples/river_mask.asc --source 0,53 --source 0,54 --catchment-area 150 --edges S --out results
 ```
 
+## Build a storm by answering questions
+
+Press Run on `flood_sim.py`, pick your elevation, then rain option **4) build a storm**. It asks:
+storm type (颱風 typhoon / 午後雷陣雨 thunderstorm / 梅雨鋒面 plum rain / single peak / uniform), total rain, hours,
+start time, which side it comes from (N/S/E/W) and how long it takes to cross the map, and extra rain on mountains.
+It saves the rain file (e.g. `rain_typhoon_800mm.csv`) so you can reuse or edit it, then runs.
+
+Without questions: `--rain-storm typhoon,800,48,S` (type, total mm, hours, comes from), or make just the file with
+`python storm.py` (asks) / `python storm.py --type typhoon --total 800 --area 24.67,121.28,25.30,121.416`.
+
+## Animation
+
+Every run (unless `--no-plots` or `--no-animation`) also writes **`flood_animation.gif`**, plus **`flood_animation.mp4`** if ffmpeg is installed (`brew install ffmpeg`). It shows:
+- the water spreading over the map, with community circles turning green → orange → red (safe / warning / evacuate),
+- rain per hour and total rain, with a moving line for the current time,
+- the real date and time; with forecast rain, frames after "now" are labelled 預報 forecast and the future part of the chart is shaded.
+
+Options: `--animate-every 30` (minutes per frame; default ≈150 frames over the run), `--fps 6`.
+
+**Model note:** flows now use the de Almeida et al. (2012) smoothing (`--theta 0.7`), which stops deep pools in hilly terrain from sloshing unrealistically. On the valley demo this makes evacuation about an hour earlier than before; `--theta 1` gives the old behaviour.
+
 ## Choosing where the data comes from
 
 `flood_sim.py` can take each input from **your own file** or **download it from Open-Meteo** (https://open-meteo.com/en/docs). You can mix them.
@@ -61,6 +82,13 @@ python flood_sim.py --dem dem.asc --rain-values 5,20,60,80,40,10
 | `--rain-model` | forecast model, e.g. `best_match` (default), `jma_seamless`, `ecmwf_ifs025`, `gfs_seamless` |
 | `--rain-values` | rain typed in by hand, mm per hour, comma-separated |
 | `--cache`, `--refresh` | downloads are kept in `openmeteo_cache/` and re-used; `--refresh` downloads again |
+
+**Elevation as x/y/z points (JSON).** Files like `[{"x": "24.67", "y": "121.2925", "z": "1170"}, ...]` work directly (numbers or strings; `lat/lon/elevation` keys and `[x, y, z]` lists also work). One file is usually one line of points, so give a **folder** or a **glob** to cover an area:
+```bash
+python flood_sim.py --dem my_points/ --rain online --start 2024-10-02 --end 2024-10-04
+python flood_sim.py --dem "my_points/*.json" --rain online --forecast 3
+```
+Which of x/y is latitude is detected from the values (longitude > 90 in Taiwan); force it with `--xy-order latlon` (x = latitude) or `lonlat`. Points with height 0 count as sea. The rain area is taken from the points automatically.
 
 If your elevation file has no coordinates (`.asc`, matrix `.csv`, `.png`), online rain is averaged over `--area` and applied everywhere.
 

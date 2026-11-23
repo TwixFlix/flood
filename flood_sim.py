@@ -47,6 +47,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+from datetime import datetime
 
 G = 9.81
 # Horton infiltration: (f0 initial mm/h, fc final mm/h, tau decay hours)
@@ -102,32 +103,153 @@ def _read_text_matrix(text: str) -> np.ndarray:
     return np.array([r[:w] for r in rows], dtype=np.float64)
 
 
-def read_latlon_dem(path: str, dx: float | None) -> tuple[np.ndarray, GridMeta]:
-    """Long-format CSV with lat, lon, elevation (e.g. from elevation_box.py).
+XY_ORDER = "auto"   # how to read x/y columns in point files: auto, latlon (x=lat) or lonlat (x=lon)
+_ELEV_KEYS = ("elevation_m", "elevation", "elev", "z", "height", "height_m", "h", "alt", "altitude")
 
-    The points form a regular lat/lon grid; it is resampled (bilinear) onto a
-    square grid in metres so the flow model sees equal cell sizes.
-    """
+
+def _point_files(path):
+    """A point-elevation input can be one file, a folder of files, a glob or a comma list."""
+    import glob
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.json")) + glob.glob(os.path.join(path, "*.csv")))
+    elif any(ch in path for ch in "*?["):
+        files = sorted(glob.glob(os.path.expanduser(path)))
+    elif "," in path and not os.path.exists(path):
+        files = [p.strip() for p in path.split(",") if p.strip()]
+    else:
+        files = [path]
+    if not files:
+        raise SystemExit(f"no elevation point files found in {path!r}")
+    return files
+
+
+def is_point_dem(path):
+    """True for elevation given as points with coordinates (lat/lon CSV, x/y/z JSON, a folder of them)."""
+    if not path or path.lower() == "online":
+        return False
+    if os.path.isdir(path) or any(ch in path for ch in "*?[") or ("," in path and not os.path.exists(path)):
+        return True
+    ext = os.path.splitext(path)[1].lower()
+    return ext == ".json" or is_latlon_csv(path)
+
+
+def _num(v):
+    try:
+        f = float(v)
+        return f if math.isfinite(f) else np.nan
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _read_point_json(path):
+    """JSON list of points: [{"x": "24.67", "y": "121.29", "z": "1170"}, ...]
+    (also lat/lon/elevation keys, [x, y, z] lists, or {"points": [...]})."""
+    import json
+    with open(path, encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = next((v for k, v in data.items() if isinstance(v, list)), [data])
+    a, b, z, water, named = [], [], [], [], None
+    for p in data:
+        if isinstance(p, (list, tuple)):
+            a.append(_num(p[0])); b.append(_num(p[1])); z.append(_num(p[2]) if len(p) > 2 else np.nan)
+            water.append(False); named = named or "xy"
+            continue
+        d = {str(k).lower(): v for k, v in p.items()}
+        if "lat" in d and ("lon" in d or "lng" in d):
+            a.append(_num(d["lat"])); b.append(_num(d.get("lon", d.get("lng")))); named = "latlon"
+        else:
+            a.append(_num(d.get("x"))); b.append(_num(d.get("y"))); named = named or "xy"
+        z.append(next((_num(d[k]) for k in _ELEV_KEYS if k in d), np.nan))
+        water.append(str(d.get("is_water", "")).lower() in ("true", "1", "yes"))
+    return np.array(a), np.array(b), np.array(z), np.array(water, bool), named
+
+
+def _read_point_csv(path):
     header, rows = _read_table(path)
     low = [h.lower() for h in header]
-    ila, ilo = low.index("lat"), low.index("lon")
-    iel = next(i for i, h in enumerate(low) if h in ("elevation_m", "elevation", "elev", "z", "height", "height_m"))
+    if "lat" in low and ("lon" in low or "lng" in low):
+        ia, ib, named = low.index("lat"), low.index("lon" if "lon" in low else "lng"), "latlon"
+    else:
+        ia, ib, named = low.index("x"), low.index("y"), "xy"
+    iel = next(i for i, h in enumerate(low) if h in _ELEV_KEYS)
     iw = low.index("is_water") if "is_water" in low else None
-    lat = np.array([float(r[ila]) for r in rows]); lon = np.array([float(r[ilo]) for r in rows])
-    el = np.array([float(r[iel]) if r[iel] not in ("", "nan", "None") else np.nan for r in rows])
+    a = np.array([_num(r[ia]) for r in rows]); b = np.array([_num(r[ib]) for r in rows])
+    el = np.array([_num(r[iel]) for r in rows])
     wat = np.array([r[iw].strip().lower() in ("true", "1", "yes") for r in rows]) if iw is not None else np.zeros(len(rows), bool)
+    return a, b, el, wat, named
+
+
+def read_latlon_dem(path: str, dx: float | None) -> tuple[np.ndarray, GridMeta]:
+    """Elevation points with coordinates: a lat/lon CSV (e.g. from elevation_box.py), or
+    x/y/z JSON or CSV files (one file or a folder, e.g. one file per longitude line).
+
+    The points must form a (roughly) regular lat/lon grid; they are resampled onto a
+    square grid in metres so the flow model sees equal cell sizes.
+    """
+    files = _point_files(path)
+    parts = []
+    for fpath in files:
+        reader = _read_point_json if fpath.lower().endswith(".json") else _read_point_csv
+        parts.append(reader(fpath))
+    A = np.concatenate([p[0] for p in parts]); B = np.concatenate([p[1] for p in parts])
+    el = np.concatenate([p[2] for p in parts]); wat = np.concatenate([p[3] for p in parts])
+    named = {p[4] for p in parts}
+    if "latlon" in named and len(named) == 1:
+        lat, lon = A, B
+    else:  # x/y columns: which one is latitude?
+        order = XY_ORDER
+        if order == "auto":
+            if np.nanmax(np.abs(B)) > 90 >= np.nanmax(np.abs(A)):
+                order = "latlon"
+            elif np.nanmax(np.abs(A)) > 90 >= np.nanmax(np.abs(B)):
+                order = "lonlat"
+            else:
+                order = "lonlat"
+                print("  note: can't tell which of x/y is latitude; assuming x = longitude, y = latitude "
+                      "(use --xy-order latlon if it is the other way round)")
+        lat, lon = (A, B) if order == "latlon" else (B, A)
+        if np.nanmax(np.abs(lat)) > 90 or np.nanmax(np.abs(lon)) > 180:
+            raise SystemExit("x/y values are not degrees (map coordinates in metres?). Point files need "
+                             "latitude/longitude; for metre grids use an .asc or .tif file instead.")
+        print(f"  reading x/y as {'x = latitude, y = longitude' if order == 'latlon' else 'x = longitude, y = latitude'}")
+    ok = np.isfinite(lat) & np.isfinite(lon)
+    lat, lon, el, wat = lat[ok], lon[ok], el[ok], wat[ok]
+    if not wat.any():
+        wat = np.nan_to_num(el, nan=1.0) <= 0      # no water flags given: height 0 or below = sea (as Open-Meteo returns)
     lats, lons = np.unique(np.round(lat, 6)), np.unique(np.round(lon, 6))
+    print(f"  {len(files)} file(s), {len(lat):,} points: lat {lats[0]:.4f}–{lats[-1]:.4f}, "
+          f"lon {lons[0]:.4f}–{lons[-1]:.4f}, height {np.nanmin(el):.0f}–{np.nanmax(el):.0f} m")
+    if len(lats) < 2 or len(lons) < 2:
+        one = f"longitude {lons[0]:.4f}" if len(lons) < 2 else f"latitude {lats[0]:.4f}"
+        raise SystemExit(f"these points are a single line ({one}), but a flood map needs an area.\n"
+                         f"  Give a folder or several files, one per line, e.g. --dem my_points/ or --dem 'data/*.json',\n"
+                         f"  or download the area with --dem online --area south,west,north,east.")
     E = np.full((len(lats), len(lons)), np.nan); W = np.zeros_like(E, dtype=bool)
     ia = np.searchsorted(lats, np.round(lat, 6)); io_ = np.searchsorted(lons, np.round(lon, 6))
     E[ia, io_] = el; W[ia, io_] = wat
-    if np.isnan(E).any():  # fill holes from neighbours
-        m = np.isnan(E); E[m] = np.nanmean(E)
+    holes = np.isnan(E)
+    if holes.any():  # fill gaps from neighbouring points
+        if holes.mean() > 0.05:
+            print(f"  note: {holes.mean():.0%} of grid positions have no point; filled from neighbours")
+        for _ in range(max(E.shape)):
+            if not np.isnan(E).any():
+                break
+            P = np.pad(E, 1, constant_values=np.nan)
+            nb = np.stack([P[:-2, 1:-1], P[2:, 1:-1], P[1:-1, :-2], P[1:-1, 2:]])
+            cnt = np.isfinite(nb).sum(0)
+            m = np.isnan(E) & (cnt > 0)
+            E[m] = (np.nansum(nb, 0) / np.maximum(cnt, 1))[m]
+        E[np.isnan(E)] = np.nanmean(el)
     latc, lonc = (lats[0] + lats[-1]) / 2, (lons[0] + lons[-1]) / 2
     kx = 111320.0 * math.cos(math.radians(latc)); ky = 110574.0
-    dlat = (lats[-1] - lats[0]) / max(len(lats) - 1, 1); dlon = (lons[-1] - lons[0]) / max(len(lons) - 1, 1)
+    dlat = float(np.median(np.diff(lats))); dlon = float(np.median(np.diff(lons)))
+    auto_dx = not dx
     if not dx:
-        dx = round(min(dlat * ky, dlon * kx), 1)
-    if dx > 150:
+        dx = round(max(min(dlat * ky, dlon * kx), 10.0), 1)
+    if dx > 150 and not auto_dx:
+        print(f"  note: {dx:g} m cells are coarse; fine for a quick test, use --dx 100 or less for real results.")
+    elif dx > 150:
         print(f"  WARNING: elevation points are {dx:.0f} m apart. Floods follow features smaller than this, "
               f"so results will be rough.\n           Re-download with elevation_box.py --step-m 100 (or smaller).")
     width, height = (lons[-1] - lons[0]) * kx, (lats[-1] - lats[0]) * ky
@@ -137,7 +259,8 @@ def read_latlon_dem(path: str, dx: float | None) -> tuple[np.ndarray, GridMeta]:
                                           bounds=(float(lats[0]), float(lons[0]), float(lats[-1]), float(lons[-1]))))
     rr, cc = np.mgrid[0:ny, 0:nx]
     glat, glon = meta.rc_to_latlon(rr, cc)
-    fi = np.clip((glat - lats[0]) / dlat, 0, len(lats) - 1); fj = np.clip((glon - lons[0]) / dlon, 0, len(lons) - 1)
+    fi = np.interp(glat, lats, np.arange(len(lats)))   # handles uneven spacing too
+    fj = np.interp(glon, lons, np.arange(len(lons)))
     i0, j0 = np.floor(fi).astype(int), np.floor(fj).astype(int)
     i1, j1 = np.minimum(i0 + 1, len(lats) - 1), np.minimum(j0 + 1, len(lons) - 1)
     ti, tj = fi - i0, fj - j0
@@ -146,6 +269,8 @@ def read_latlon_dem(path: str, dx: float | None) -> tuple[np.ndarray, GridMeta]:
     T = np.where(sea, np.minimum(T, -1.0), T)   # water cells become sea (below 0 m)
     print(f"  lat/lon DEM {len(lats)}×{len(lons)} points ({dlat*ky:.0f}×{dlon*kx:.0f} m) -> "
           f"{ny}×{nx} square cells of {dx:g} m; {int(sea.sum())} sea cells")
+    if ny * nx > 300_000:
+        print(f"  note: {ny*nx:,} cells is a big run (can take hours). Speed up with --dx 100 or --coarsen 2.")
     return T, meta
 
 
@@ -162,7 +287,7 @@ def read_grid(path: str, png_min=0.0, png_max=500.0, nodata=None, dx=None) -> tu
     """Read a 2D grid. Row 0 is the NORTH edge. Returns (array, meta)."""
     ext = os.path.splitext(path)[1].lower()
     meta = GridMeta()
-    if is_latlon_csv(path):
+    if is_point_dem(path):
         return read_latlon_dem(path, dx)
     if ext == ".asc":
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -620,13 +745,26 @@ class FloodModel:
             self.urban[t.cells] = True
 
     # face flux update (vectorised)
+    THETA = 0.7   # de Almeida et al. (2012) weighting; damps checkerboard sloshing in deep, slow water
+
     @staticmethod
-    def _face(q, Ha, Hb, za, zb, dt, dx, n2):
+    def _smooth(q, axis):
+        """theta-weighted face flux: theta*q + (1-theta)/2*(q_prev + q_next) along the flow axis."""
+        th = FloodModel.THETA
+        out = q.copy()
+        if axis == 1 and q.shape[1] > 2:
+            out[:, 1:-1] = th * q[:, 1:-1] + (1 - th) / 2 * (q[:, :-2] + q[:, 2:])
+        elif axis == 0 and q.shape[0] > 2:
+            out[1:-1, :] = th * q[1:-1, :] + (1 - th) / 2 * (q[:-2, :] + q[2:, :])
+        return out
+
+    @staticmethod
+    def _face(q, Ha, Hb, za, zb, dt, dx, n2, qs=None):
         hf = np.maximum(Ha, Hb) - np.maximum(za, zb)
         wet = hf > 0.002
         hfs = np.where(wet, hf, 1.0)
         S = (Hb - Ha) / dx
-        qn = (q - G * hfs * dt * S) / (1 + G * dt * n2 * np.abs(q) / (hfs ** (7 / 3)))
+        qn = ((q if qs is None else qs) - G * hfs * dt * S) / (1 + G * dt * n2 * np.abs(q) / (hfs ** (7 / 3)))
         lim = hfs * np.sqrt(G * hfs)
         qn = np.clip(qn, -lim, lim)
         return np.where(wet, qn, 0.0)
@@ -637,8 +775,9 @@ class FloodModel:
         H = T + D
         ghost = 0.003 * dx
         # interior faces
-        self.qx[:, 1:-1] = self._face(self.qx[:, 1:-1], H[:, :-1], H[:, 1:], T[:, :-1], T[:, 1:], dt, dx, n2)
-        self.qy[1:-1, :] = self._face(self.qy[1:-1, :], H[:-1, :], H[1:, :], T[:-1, :], T[1:, :], dt, dx, n2)
+        qxs, qys = self._smooth(self.qx, 1), self._smooth(self.qy, 0)
+        self.qx[:, 1:-1] = self._face(self.qx[:, 1:-1], H[:, :-1], H[:, 1:], T[:, :-1], T[:, 1:], dt, dx, n2, qxs[:, 1:-1])
+        self.qy[1:-1, :] = self._face(self.qy[1:-1, :], H[:-1, :], H[1:, :], T[:-1, :], T[1:, :], dt, dx, n2, qys[1:-1, :])
         # boundaries: open = free outflow into a ghost cell slightly lower and dry
         e = P.edges.upper()
         if "W" in e:
@@ -666,7 +805,8 @@ class FloodModel:
         qx, qy = self.qx, self.qy
         out = (np.maximum(-qx[:, :-1], 0) + np.maximum(qx[:, 1:], 0) +
                np.maximum(-qy[:-1, :], 0) + np.maximum(qy[1:, :], 0)) * dt / dx
-        sc = np.where(out > D, D / np.where(out > 0, out, 1), 1.0)
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            sc = np.where(out > D, D / np.where(out > 0, out, 1), 1.0)
         qx[:, 1:] = np.where(qx[:, 1:] > 0, qx[:, 1:] * sc, qx[:, 1:])
         qx[:, :-1] = np.where(qx[:, :-1] < 0, qx[:, :-1] * sc, qx[:, :-1])
         qy[1:, :] = np.where(qy[1:, :] > 0, qy[1:, :] * sc, qy[1:, :])
@@ -1016,6 +1156,132 @@ def draw_timeline(plt, series, towns, outdir, P):
     return "timeline.png"
 
 
+def make_animation(plt, frames, T, model, towns, series, outdir, P, fps=6, mp4=True):
+    """Animated map of water depth over time + rain chart with a moving 'now' line.
+    Writes flood_animation.gif (and .mp4 when ffmpeg is installed)."""
+    import datetime as dtm
+    from matplotlib import animation
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Circle
+    if len(frames) < 2:
+        return []
+    ny, nx = T.shape
+    k = max(1, int(math.ceil(max(ny, nx) / 700)))          # keep frames a sensible size
+    hs = hillshade(T, P.dx)[::k, ::k]
+    sea = model.sea[::k, ::k]
+    ext = (0, nx, ny, 0)
+    tall = ny > 1.3 * nx
+    if tall:      # map on the left, charts on the right
+        fig = plt.figure(figsize=(11, 8), dpi=100)
+        gs = fig.add_gridspec(3, 2, width_ratios=[1.0, 1.25], height_ratios=[1, 1, 0.55], wspace=0.25, hspace=0.35,
+                              left=0.03, right=0.92, top=0.94, bottom=0.07)
+        ax_map = fig.add_subplot(gs[:, 0]); ax_r = fig.add_subplot(gs[0, 1]); ax_d = fig.add_subplot(gs[1, 1], sharex=ax_r)
+        ax_txt = fig.add_subplot(gs[2, 1])
+    else:         # map on top, charts below
+        mh = 6.4 * ny / nx
+        fig = plt.figure(figsize=(8, mh + 2.6), dpi=100)
+        gs = fig.add_gridspec(2, 2, height_ratios=[mh, 1.7], width_ratios=[1.5, 1], hspace=0.22, wspace=0.35,
+                              left=0.08, right=0.97, top=0.95, bottom=0.08)
+        ax_map = fig.add_subplot(gs[0, :]); ax_r = fig.add_subplot(gs[1, 0]); ax_d = ax_r.twinx()
+        ax_txt = fig.add_subplot(gs[1, 1])
+
+    ax_map.imshow(hs, cmap="gray", vmin=-0.2, vmax=1.2, extent=ext, interpolation="bilinear")
+    ax_map.imshow(np.ma.masked_where(~sea, np.ones_like(hs)), cmap=ListedColormap(["#7fa8d1"]), extent=ext, alpha=0.9)
+    vmax = max(1.0, float(np.nanpercentile([np.nanmax(f["d"]) if np.isfinite(f["d"]).any() else 0 for f in frames], 95)))
+    vmax = min(vmax, 3.0)
+    im = ax_map.imshow(np.full_like(hs, np.nan), cmap="Blues", vmin=0, vmax=vmax, extent=ext,
+                       alpha=0.92, interpolation="nearest")
+    cb = fig.colorbar(im, ax=ax_map, fraction=0.035 if not tall else 0.05, pad=0.02)
+    cb.set_label("水深 water depth (m)")
+    rings = []
+    for t in towns:
+        c = Circle((t.col, t.row), t.radius, fill=False, ec="#2e7d32", lw=2)
+        ax_map.add_patch(c)
+        ax_map.text(t.col, t.row - t.radius - 1, t.name, ha="center", va="bottom", fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.75))
+        rings.append(c)
+    ax_map.set_xticks([]); ax_map.set_yticks([])
+    title = ax_map.set_title("", fontsize=11)
+
+    t_h = np.array(series["t"]) / 3600
+    rain = np.array(series["rain"])
+    step = (t_h[1] - t_h[0]) if len(t_h) > 1 else 0.1
+    ax_r.bar(t_h, rain, width=step, color="#4a8fd0", alpha=0.85)
+    ax_r.set_ylabel("雨量 rain (mm/h)", color="#2a6fb0")
+    cum = np.cumsum(rain * step)
+    ax_c = ax_r.twinx() if tall else None
+    if ax_c is not None:
+        ax_c.plot(t_h, cum, color="#1c3e78", lw=1.4); ax_c.set_ylabel("累積 total (mm)", color="#1c3e78")
+    dmax_series = np.array([f["dmax"] for f in frames]); ft = np.array([f["t"] for f in frames]) / 3600
+    ax_d.plot(ft, dmax_series, color="#c62828", lw=1.6, label="最大水深 (河道外) max depth off-channel")
+    if towns and tall:
+        for tw in towns:
+            ax_d.plot(t_h, series["towns"][tw.name], lw=1.0, alpha=0.8, label=tw.name)
+        ax_d.axhline(P.evac_depth, color="#c62828", ls="--", lw=0.8)
+    ax_d.set_ylabel("水深 depth (m)", color="#c62828")
+    if tall:
+        ax_d.set_xlabel("小時 hours" if T0 is None else f"小時 hours from {T0:%Y-%m-%d %H:%M}")
+        ax_d.legend(fontsize=7, loc="upper left", ncol=2)
+        ax_r.set_title("降雨與水深 Rain and water depth", fontsize=10)
+    else:
+        ax_r.set_xlabel("小時 hours" if T0 is None else f"小時 hours from {T0:%Y-%m-%d %H:%M}")
+    for ax in (ax_r, ax_d):
+        ax.grid(alpha=0.25)
+    now_lines = [ax_r.axvline(0, color="k", lw=1.2)] + ([ax_d.axvline(0, color="k", lw=1.2)] if tall else [])
+    real_now = None
+    if T0 is not None:
+        real_now = (dtm.datetime.now() - T0).total_seconds() / 3600
+        if t_h[0] < real_now < t_h[-1]:
+            for ax in ([ax_r, ax_d] if tall else [ax_r]):
+                ax.axvspan(real_now, t_h[-1] + step, color="#ffcc80", alpha=0.18, lw=0)
+            ax_r.text(real_now, ax_r.get_ylim()[1], " 預報 forecast →", fontsize=8, va="top", color="#a65c00")
+    ax_txt.axis("off")
+    info = ax_txt.text(0.0, 1.0, "", va="top", ha="left", fontsize=9.5, family=plt.rcParams["font.sans-serif"],
+                       transform=ax_txt.transAxes)
+    colors = {"EVACUATE": "#c62828", "WARNING": "#e07b00", "safe": "#2e7d32"}
+
+    def draw(i):
+        f = frames[i]
+        im.set_data(f["d"])
+        th = f["t"] / 3600
+        for ln in now_lines:
+            ln.set_xdata([th, th])
+        for c, st in zip(rings, f["status"]):
+            c.set_edgecolor(colors[st])
+        when = fmt_h(f["t"])
+        tag = ""
+        if real_now is not None:
+            tag = "  [預報 forecast]" if th > real_now else "  [過去 past]"
+        title.set_text(f"{when}{tag}")
+        ev = [tw.name for tw, st in zip(towns, f["status"]) if st == "EVACUATE"]
+        wn = [tw.name for tw, st in zip(towns, f["status"]) if st == "WARNING"]
+        lines = [f"雨量 rain now:  {f['rain']:.1f} mm/h",
+                 f"累積雨量 total so far:  {f['cum']:.0f} mm",
+                 f"最大水深 deepest (off river):  {f['dmax']:.2f} m",
+                 f"淹水 ≥0.3 m:  {f['area']:.2f} km²"]
+        if towns:
+            lines.append(f"撤離 evacuate: {', '.join(ev) if ev else '-'}")
+            if wn:
+                lines.append(f"警戒 warning: {', '.join(wn)}")
+        info.set_text("\n".join(lines))
+        return [im, title, info, *now_lines, *rings]
+
+    anim = animation.FuncAnimation(fig, draw, frames=len(frames), interval=1000 / fps, blit=False)
+    out = []
+    gif = os.path.join(outdir, "flood_animation.gif")
+    anim.save(gif, writer=animation.PillowWriter(fps=fps))
+    out.append("flood_animation.gif")
+    if mp4 and animation.writers.is_available("ffmpeg"):
+        try:
+            anim.save(os.path.join(outdir, "flood_animation.mp4"),
+                      writer=animation.FFMpegWriter(fps=fps, codec="libx264", extra_args=["-pix_fmt", "yuv420p", "-preset", "veryfast"]))
+            out.append("flood_animation.mp4")
+        except Exception as e:  # noqa: BLE001
+            print(f"  (mp4 skipped: {e})")
+    plt.close(fig)
+    return out
+
+
 def snapshot(plt, model, T, towns, outdir, P, hs_cache={}):
     from matplotlib.patches import Circle
     if "hs" not in hs_cache:
@@ -1046,8 +1312,11 @@ def build_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = p.add_argument_group("terrain 地形")
     g.add_argument("--demo", choices=["valley", "basin", "coast"], help="use a built-in demo terrain (also writes sample input files)")
-    g.add_argument("--dem", help="elevation grid: .asc (ESRI ASCII), .csv/.txt matrix, lat/lon .csv, .tif (GeoTIFF), "
-                                 "grayscale .png, or 'online' to download it from Open-Meteo for --area")
+    g.add_argument("--dem", help="elevation: .asc (ESRI ASCII), .csv/.txt matrix, lat/lon .csv, x/y/z .json points "
+                                 "(one file, a folder, or a glob like 'data/*.json'), .tif (GeoTIFF), grayscale .png, "
+                                 "or 'online' to download it from Open-Meteo for --area")
+    g.add_argument("--xy-order", choices=["auto", "latlon", "lonlat"], default="auto",
+                   help="in x/y/z point files: latlon = x is latitude, lonlat = x is longitude (auto guesses)")
     g.add_argument("--dx", type=float, help="cell size in metres (read from .asc/.tif if omitted)")
     g.add_argument("--png-min", type=float, default=0.0, help="elevation of black pixels (image DEM)")
     g.add_argument("--png-max", type=float, default=500.0, help="elevation of white pixels (image DEM)")
@@ -1062,6 +1331,8 @@ def build_parser():
     g.add_argument("--rain", help="CSV: time_h,rain_mm (one series), time_h,<station...> (with --stations), "
                                   "Open-Meteo lat,lon,time,rain_mm, or 'online' to download it")
     g.add_argument("--rain-values", help="type the rain in by hand: mm in each hour, e.g. '5,20,60,80,40,10'")
+    g.add_argument("--rain-storm", help="build a storm: TYPE[,total_mm[,hours[,from]]], TYPE = typhoon, thunderstorm, "
+                                        "plumrain, single, uniform; e.g. 'typhoon,800,48,S'")
     g.add_argument("--stations", help="CSV of rain-station locations: name,row,col or name,x,y (IDW interpolation)")
     g.add_argument("--rain-grid", help="grid multiplier on rainfall (same size as DEM), e.g. a radar-based ratio map")
     g.add_argument("--rain-total", type=float, default=350.0, help="synthetic storm: total rainfall (mm)")
@@ -1099,6 +1370,8 @@ def build_parser():
     g.add_argument("--soil", choices=list(SOILS), default="loam")
     g.add_argument("--drain", type=float, default=78.8, help="storm-drain capacity inside communities (mm/h)")
     g.add_argument("--manning", type=float, default=0.035, help="Manning roughness n")
+    g.add_argument("--theta", type=float, default=0.7,
+                   help="flux smoothing 0.7–1.0 (lower = more stable in deep pools; 1 = no smoothing, the old behaviour)")
     g.add_argument("--towns", help="CSV of communities: name,population,radius_m and row,col or x,y")
     g.add_argument("--evac-depth", type=float, default=0.5)
     g.add_argument("--warn-depth", type=float, default=0.3)
@@ -1110,6 +1383,10 @@ def build_parser():
     g.add_argument("--duration", type=float, help="total simulated hours (overrides --hours-after)")
     g.add_argument("--report-every", type=float, default=5.0, help="community check interval (minutes)")
     g.add_argument("--snapshot-every", type=float, default=0.0, help="save a depth map every N hours (0 = off)")
+    g.add_argument("--no-animation", action="store_true", help="skip flood_animation.gif / .mp4")
+    g.add_argument("--animate-every", type=float, default=0.0,
+                   help="minutes between animation frames (0 = automatic, about 150 frames)")
+    g.add_argument("--fps", type=float, default=6.0, help="animation frames per second")
     g.add_argument("--out", default="flood_results", help="output folder")
     g.add_argument("--no-plots", action="store_true")
     return p
@@ -1166,8 +1443,13 @@ def setup_questions():
     src = _ask("choose", "1" if found_dem else "2", ["1", "2", "3"])
     area = None
     if src == "1":
-        args += ["--dem", _ask_file("elevation file (.asc .tif .csv .png)", found_dem)]
-        if os.path.splitext(args[-1])[1].lower() in (".csv", ".txt", ".png") and not is_latlon_csv(args[-1]):
+        args += ["--dem", _ask_file("elevation file (.asc .tif .csv .png .json) or a folder of x/y/z point files",
+                                    found_dem)]
+        if is_point_dem(args[-1]):
+            dx = _ask("cell size in metres (Enter = 100, runs much faster than full detail; 0 = full detail)", "100")
+            if dx not in ("", "0"):
+                args += ["--dx", dx]
+        elif os.path.splitext(args[-1])[1].lower() in (".csv", ".txt", ".png"):
             dx = _ask("cell size in metres", "40")
             args += ["--dx", dx]
     elif src == "2":
@@ -1178,7 +1460,7 @@ def setup_questions():
 
     if src != "3":
         print("\nRain 降雨:\n  1) my own file\n  2) download from Open-Meteo (past or forecast)"
-              "\n  3) type it in (mm in each hour)\n  4) made-up design storm")
+              "\n  3) type it in (mm in each hour)\n  4) build a storm (typhoon, thunderstorm, plum rain ...)")
         r = _ask("choose", "1" if found_rain else "2", ["1", "2", "3", "4"])
         if r == "1":
             args += ["--rain", _ask_file("rain file (.csv)", found_rain)]
@@ -1188,7 +1470,7 @@ def setup_questions():
                     args += ["--stations", st]
         elif r == "2":
             args += ["--rain", "online"]
-            dem_is_geo = src == "2" or (src == "1" and is_latlon_csv(args[1]))
+            dem_is_geo = src == "2" or (src == "1" and is_point_dem(args[1]))
             if not dem_is_geo:
                 area = _ask("area for the rain, south,west,north,east (degrees)", DEFAULT_AREA)
             if area and "--area" not in args:
@@ -1202,13 +1484,23 @@ def setup_questions():
         elif r == "3":
             args += ["--rain-values", _ask("mm of rain in each hour, comma-separated", "10,30,60,80,50,20,10")]
         else:
-            args += ["--rain-total", _ask("total rain (mm)", "350"), "--rain-hours", _ask("over how many hours", "24")]
+            import storm
+            box = None
+            if src == "2":
+                import online as _ol
+                box = _ol.parse_box(area)
+            elif is_point_dem(args[1]):
+                print("  (reading the elevation file to find its area...)")
+                _, m = read_grid(args[1])
+                box = m.geo["bounds"]
+            path, oro = storm.ask_storm(_ask, box)
+            args += ["--rain", path, "--oro", f"{oro:g}"]
 
         t = _ask("\ncommunities file (name,population,lat,lon,radius_m) — Enter for none", found_towns or "")
         if t:
             args += ["--towns", t]
         if src in ("1", "2"):
-            geo = src == "2" or is_latlon_csv(args[1])
+            geo = src == "2" or is_point_dem(args[1])
             sl = _ask(f"river entering the area from upstream? give {'lat,lon' if geo else 'row,col'} "
                       f"where it enters (Enter = none)", "")
             if sl:
@@ -1231,6 +1523,28 @@ def resolve_online_dem(a):
 
 def resolve_online_rain(a, meta):
     """--rain online / --rain-values -> a rain CSV path; returns the datetime of t=0 if known."""
+    if getattr(a, "rain_storm", None):
+        import storm
+        parts = [p.strip() for p in a.rain_storm.split(",")]
+        kind = parts[0].lower()
+        if kind not in storm.TYPES:
+            raise SystemExit(f"--rain-storm type must be one of: {', '.join(storm.TYPES)}")
+        _, tot0, hrs0, _, oro0 = storm.TYPES[kind]
+        total = float(parts[1]) if len(parts) > 1 and parts[1] else tot0
+        hours = float(parts[2]) if len(parts) > 2 and parts[2] else hrs0
+        frm = parts[3] if len(parts) > 3 else "S"
+        os.makedirs(os.path.join(a.out, "inputs"), exist_ok=True)
+        path = os.path.join(a.out, "inputs", f"rain_{kind}_{total:.0f}mm.csv")
+        box = meta.geo["bounds"] if (meta is not None and meta.geo) else None
+        if box is None and a.area:
+            box = None  # a DEM without coordinates can only use one series
+        start = datetime.strptime(a.start, "%Y-%m-%d") if a.start else None
+        peak, _ = storm.write_storm(path, kind, total, hours, start, box, frm)
+        print(f"Storm: {kind}, {total:g} mm over {hours:g} h, peak {peak:.0f} mm/h -> {path}")
+        if a.oro is None:
+            a.oro = oro0
+        a.rain = path
+        return None
     if a.rain_values:
         import online
         os.makedirs(os.path.join(a.out, "inputs"), exist_ok=True)
@@ -1274,8 +1588,10 @@ def main(argv=None):
             print("\n(no answers; looking for files next to the script instead)")
             argv = []
     a = build_parser().parse_args(argv)
-    if a.rain_values and a.rain:
-        raise SystemExit("give either --rain or --rain-values, not both")
+    if sum(bool(v) for v in (a.rain, a.rain_values, a.rain_storm)) > 1:
+        raise SystemExit("give only one of --rain, --rain-values or --rain-storm")
+    global XY_ORDER
+    XY_ORDER = a.xy_order
     resolve_online_dem(a)
     if not a.dem and not a.demo:
         # No terrain given (e.g. pressed Run in an IDE): use files found next to the script, else a demo.
@@ -1384,6 +1700,7 @@ def main(argv=None):
     P = Params(dx=dx, manning=a.manning, soil=a.soil, drain=a.drain, oro=oro, sea_level=a.sea_level,
                sea_below=a.sea_below, edges=a.edges or "", evac_depth=a.evac_depth, warn_depth=a.warn_depth,
                area_pct=a.area_pct, hazard_limit=a.hazard_limit)
+    FloodModel.THETA = min(max(a.theta, 0.5), 1.0)
     model = FloodModel(T, P, rain, inflow, sources, towns, river)
     spin = a.spinup if a.spinup is not None else (6.0 if sources and (inflow.area > 0 or a.inflow) else 0.0)
     if spin > 0:
@@ -1408,6 +1725,13 @@ def main(argv=None):
         os.makedirs(os.path.join(a.out, "snapshots"), exist_ok=True)
     rep = a.report_every * 60
     next_rep, next_snap, next_print = 0.0, 0.0, 3600.0
+    frames, next_anim = [], 0.0
+    if plt and not a.no_animation:
+        anim_dt = a.animate_every * 60 if a.animate_every > 0 else max(rep, round(end_s / 150 / rep) * rep)
+        kk = max(1, int(math.ceil(max(ny, nx) / 700)))
+        land_anim = ~model.sea
+    else:
+        anim_dt = None
     results = {t.name: {"evac_t": None, "warn_t": None, "peak": 0.0, "peak_t": None, "worst": "safe",
                         "evac_end": None} for t in towns}
     series = {"t": [], "rain": [], "inflow": [], "towns": {t.name: [] for t in towns}}
@@ -1440,6 +1764,16 @@ def main(argv=None):
                     r["worst"] = s
                 timeline_rows.append([round(model.t / 3600, 3), tw.name, s, round(dmx, 3), round(dmed, 3), round(hz, 3)])
             next_rep += rep
+        if anim_dt and model.t >= next_anim - 1e-6:
+            dd = model.D[::kk, ::kk]
+            land_now = land_anim & ~model.river if model.river is not None else land_anim
+            wet = (model.D >= 0.3) & land_now
+            frames.append({"t": model.t, "d": np.where((dd < 0.03) | model.sea[::kk, ::kk], np.nan, dd).astype(np.float32),
+                           "dmax": float(model.D[land_now].max()) if land_now.any() else 0.0,
+                           "rain": float(np.mean(rain.field(model.t))), "cum": model.cum_rain,
+                           "area": float(wet.sum()) * dx * dx / 1e6,
+                           "status": [model.town_status(tw, model.hazard())[0] for tw in towns]})
+            next_anim += anim_dt
         if plt and a.snapshot_every > 0 and model.t >= next_snap - 1e-6:
             snapshot(plt, model, T, towns, a.out, P)
             next_snap += a.snapshot_every * 3600
@@ -1495,6 +1829,9 @@ def main(argv=None):
         figs = draw_maps(plt, model, T, towns, results, a.out, P)
         if series["t"]:
             figs.append(draw_timeline(plt, series, towns, a.out, P))
+        if frames:
+            print(f"Making animation ({len(frames)} frames)...", flush=True)
+            figs += make_animation(plt, frames, T, model, towns, series, a.out, P, a.fps)
 
     # report
     evac = sorted([tw for tw in towns if results[tw.name]["evac_t"] is not None], key=lambda t: results[t.name]["evac_t"])
