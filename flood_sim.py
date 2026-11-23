@@ -1384,6 +1384,7 @@ def build_parser():
     g.add_argument("--report-every", type=float, default=5.0, help="community check interval (minutes)")
     g.add_argument("--snapshot-every", type=float, default=0.0, help="save a depth map every N hours (0 = off)")
     g.add_argument("--no-animation", action="store_true", help="skip flood_animation.gif / .mp4")
+    g.add_argument("--no-3d", action="store_true", help="skip flood_3d.html (interactive 3D view)")
     g.add_argument("--animate-every", type=float, default=0.0,
                    help="minutes between animation frames (0 = automatic, about 150 frames)")
     g.add_argument("--fps", type=float, default=6.0, help="animation frames per second")
@@ -1439,12 +1440,20 @@ def setup_questions():
     args = []
     found_dem, found_rain, found_towns = _find(DEM_NAMES), _find(RAIN_NAMES), _find(TOWN_NAMES)
 
-    print("\nElevation 地形:\n  1) my own file\n  2) download from Open-Meteo (pick an area)\n  3) built-in demo")
-    src = _ask("choose", "1" if found_dem else "2", ["1", "2", "3"])
+    taipei = _find(["taipei_lon_data"])
+    print("\nElevation 地形:\n  1) my own file\n  2) download from Open-Meteo (pick an area)\n  3) built-in demo"
+          "\n  4) taipei_lon_data" + ("" if taipei else "  (folder not found next to flood_sim.py)"))
+    src = _ask("choose", "4" if taipei else ("1" if found_dem else "2"), ["1", "2", "3", "4"])
     area = None
-    if src == "1":
+    if src == "4":
+        if not taipei:
+            raise SystemExit("taipei_lon_data folder not found; put it next to flood_sim.py")
+        args += ["--dem", taipei]
+        src = "1"   # from here on it is handled like your own file
+    elif src == "1":
         args += ["--dem", _ask_file("elevation file (.asc .tif .csv .png .json) or a folder of x/y/z point files",
                                     found_dem)]
+    if src == "1":
         if is_point_dem(args[-1]):
             dx = _ask("cell size in metres (Enter = 100, runs much faster than full detail; 0 = full detail)", "100")
             if dx not in ("", "0"):
@@ -1726,7 +1735,7 @@ def main(argv=None):
     rep = a.report_every * 60
     next_rep, next_snap, next_print = 0.0, 0.0, 3600.0
     frames, next_anim = [], 0.0
-    if plt and not a.no_animation:
+    if (plt and not a.no_animation) or not a.no_3d:
         anim_dt = a.animate_every * 60 if a.animate_every > 0 else max(rep, round(end_s / 150 / rep) * rep)
         kk = max(1, int(math.ceil(max(ny, nx) / 700)))
         land_anim = ~model.sea
@@ -1829,9 +1838,22 @@ def main(argv=None):
         figs = draw_maps(plt, model, T, towns, results, a.out, P)
         if series["t"]:
             figs.append(draw_timeline(plt, series, towns, a.out, P))
-        if frames:
+        if frames and not a.no_animation:
             print(f"Making animation ({len(frames)} frames)...", flush=True)
             figs += make_animation(plt, frames, T, model, towns, series, a.out, P, a.fps)
+    if frames and not a.no_3d and series["t"]:
+        import datetime as dtm
+        import viz3d
+        now_h = (dtm.datetime.now() - T0).total_seconds() / 3600 if T0 is not None else None
+        fc = [None if now_h is None else bool(f["t"] / 3600 > now_h) for f in frames]
+        if now_h is not None and not (frames[0]["t"] / 3600 < now_h < frames[-1]["t"] / 3600):
+            fc = [None] * len(frames)
+        name = os.path.basename(os.path.normpath(a.dem)) if a.dem else (a.demo or "")
+        if viz3d.write_3d_html(os.path.join(a.out, "flood_3d.html"), frames, T, model.sea, towns, kk, dx, series,
+                               [fmt_h(f["t"]) for f in frames], fc,
+                               title=f"3D 淹水模擬 · {name} · {rain.total:.0f} mm / {rain.hours:g} h",
+                               evac_depth=P.evac_depth):
+            figs.append("flood_3d.html")
 
     # report
     evac = sorted([tw for tw in towns if results[tw.name]["evac_t"] is not None], key=lambda t: results[t.name]["evac_t"])

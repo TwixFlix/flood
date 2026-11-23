@@ -43,6 +43,16 @@ It saves the rain file (e.g. `rain_typhoon_800mm.csv`) so you can reuse or edit 
 Without questions: `--rain-storm typhoon,800,48,S` (type, total mm, hours, comes from), or make just the file with
 `python storm.py` (asks) / `python storm.py --type typhoon --total 800 --area 24.67,121.28,25.30,121.416`.
 
+## 3D view
+
+Every run also writes **`flood_3d.html`**. Double-click it to open it in your browser (it needs internet the first time to load the free three.js 3D library):
+- the terrain in 3D, coloured by height, with the water depth painted on it as time passes,
+- community pins and rings turning green → orange → red,
+- ▶ Play / pause (or the space bar, ← → to step), a time slider, speed, and a height-exaggeration slider,
+- a rain chart at the bottom: click it to jump to that moment; forecast hours are shaded.
+
+Drag to rotate, right-drag to pan, scroll to zoom. Turn it off with `--no-3d`.
+
 ## Animation
 
 Every run (unless `--no-plots` or `--no-animation`) also writes **`flood_animation.gif`**, plus **`flood_animation.mp4`** if ffmpeg is installed (`brew install ffmpeg`). It shows:
