@@ -50,6 +50,9 @@ Every run also writes **`flood_3d.html`**. Double-click it to open it in your br
 - community pins and rings turning green → orange → red,
 - ▶ Play / pause (or the space bar, ← → to step), a time slider, speed, and a height-exaggeration slider,
 - a rain chart at the bottom: click it to jump to that moment; forecast hours are shaded.
+- two views (buttons top right, or the D key): **水深 depth** (blue shades) and **危險區 danger** — every spot coloured
+  light blue (shallow water / normal river), orange (caution, ≥ warning depth) or red (danger: ≥ evacuation depth or
+  fast-flowing water). Community rings follow the ground and use the same safe / warning / evacuate rules as the report.
 
 Drag to rotate, right-drag to pan, scroll to zoom. Turn it off with `--no-3d`.
 

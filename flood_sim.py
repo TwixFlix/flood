@@ -1156,6 +1156,16 @@ def draw_timeline(plt, series, towns, outdir, P):
     return "timeline.png"
 
 
+def _maxpool(a, k):
+    """Largest value in each k×k block (so a small danger spot is not lost when shrinking the grid)."""
+    if k <= 1:
+        return a.copy()
+    ny, nx = a.shape
+    py, px = (-ny) % k, (-nx) % k
+    b = np.pad(a, ((0, py), (0, px)), constant_values=0)
+    return b.reshape(b.shape[0] // k, k, b.shape[1] // k, k).max(axis=(1, 3))
+
+
 def make_animation(plt, frames, T, model, towns, series, outdir, P, fps=6, mp4=True):
     """Animated map of water depth over time + rain chart with a moving 'now' line.
     Writes flood_animation.gif (and .mp4 when ffmpeg is installed)."""
@@ -1777,11 +1787,18 @@ def main(argv=None):
             dd = model.D[::kk, ::kk]
             land_now = land_anim & ~model.river if model.river is not None else land_anim
             wet = (model.D >= 0.3) & land_now
+            hz_now = model.hazard()
+            # danger class per cell: 0 dry, 1 water below warning depth (or normal river), 2 warning, 3 danger
+            cls = np.zeros(model.D.shape, np.uint8)
+            cls[(model.D >= 0.03) & ~model.sea] = 1
+            cls[(model.D >= P.warn_depth) & land_now] = 2
+            cls[((model.D >= P.evac_depth) | (hz_now >= P.hazard_limit)) & land_now & (model.D >= 0.03)] = 3
             frames.append({"t": model.t, "d": np.where((dd < 0.03) | model.sea[::kk, ::kk], np.nan, dd).astype(np.float32),
+                           "cls": _maxpool(cls, kk),
                            "dmax": float(model.D[land_now].max()) if land_now.any() else 0.0,
                            "rain": float(np.mean(rain.field(model.t))), "cum": model.cum_rain,
                            "area": float(wet.sum()) * dx * dx / 1e6,
-                           "status": [model.town_status(tw, model.hazard())[0] for tw in towns]})
+                           "status": [model.town_status(tw, hz_now)[0] for tw in towns]})
             next_anim += anim_dt
         if plt and a.snapshot_every > 0 and model.t >= next_snap - 1e-6:
             snapshot(plt, model, T, towns, a.out, P)
@@ -1852,7 +1869,7 @@ def main(argv=None):
         if viz3d.write_3d_html(os.path.join(a.out, "flood_3d.html"), frames, T, model.sea, towns, kk, dx, series,
                                [fmt_h(f["t"]) for f in frames], fc,
                                title=f"3D 淹水模擬 · {name} · {rain.total:.0f} mm / {rain.hours:g} h",
-                               evac_depth=P.evac_depth):
+                               evac_depth=P.evac_depth, warn_depth=P.warn_depth):
             figs.append("flood_3d.html")
 
     # report
